@@ -87,7 +87,7 @@ else
     docker_image="linera-test:latest"
     if [ "$do_build" = true ]; then
         if [ "$(uname -m)" = "x86_64" ]; then
-            docker build -f ../../docker/Dockerfile.local ../../ -t $docker_image || exit 1
+            docker build -f ../../docker/Dockerfile ../../ -t $docker_image || exit 1
         else
             docker build -f ../../docker/Dockerfile.local-aarch64 ../../ -t $docker_image || exit 1
         fi

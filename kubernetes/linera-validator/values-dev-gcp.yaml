@@ -1,5 +1,7 @@
 # Values for charts linera-validator for the dev validator on GCP.
 
-lineraImage: us-docker.pkg.dev/linera-io-dev/linera-docker-repo/zefchain-gcp-test:0.1
+lineraImage: us-docker.pkg.dev/linera-io-dev/linera-docker-repo/linera-test-local:latest
 lineraImagePullPolicy: Always
-logLevel: "info"
+logLevel: "debug"
+staticIpGcpName: "dev-validator-1"
+proxyPort: 443

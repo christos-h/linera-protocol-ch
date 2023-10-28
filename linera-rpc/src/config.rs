@@ -72,7 +72,7 @@ impl NetworkProtocol {
     fn scheme(&self) -> &'static str {
         match self {
             NetworkProtocol::Simple(transport) => transport.scheme(),
-            NetworkProtocol::Grpc => "http",
+            NetworkProtocol::Grpc => "https",
         }
     }
 }
@@ -135,7 +135,7 @@ impl<P> ValidatorPublicNetworkPreConfig<P> {
     }
 
     pub fn http_address(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
+        format!("https://{}:443", self.host)
     }
 }
 
