@@ -7,16 +7,19 @@ mod random;
 mod state;
 mod token;
 
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom};
 
 use async_graphql::{Context, EmptyMutation, EmptySubscription, Object, Request, Response, Schema};
-use candle_core::{quantized::gguf_file, Device, Tensor};
+use candle_core::{quantized::{ggml_file, gguf_file}, Device, Tensor, IndexOp};
 use candle_transformers::{
     generation::LogitsProcessor,
-    models::{quantized_llama as model, quantized_llama::ModelWeights},
+    models::{
+        llama2_c as llama, llama2_c, llama2_c::Llama, llama2_c_weights, quantized_llama as qllama,
+        quantized_llama::ModelWeights,
+    },
 };
 use linera_sdk::{base::WithServiceAbi, Service, ServiceRuntime, ViewStateStorage};
-use log::{error, info};
+use log::{error, info, warn};
 use thiserror::Error;
 use tokenizers::Tokenizer;
 
@@ -40,6 +43,28 @@ impl QueryRoot {
     async fn prompt(&self, ctx: &Context<'_>, prompt: String) -> Result<String, ServiceError> {
         let model_context = ctx.data::<ModelContext>()?;
         model_context.run_model(&prompt)
+    }
+}
+
+enum Model {
+    Llama {
+        model: Llama,
+        config: llama2_c::Config,
+        cache: llama2_c::Cache,
+    },
+    Qllama(ModelWeights),
+}
+
+impl Model {
+    fn forward(&mut self, input: &Tensor, index_pos: usize) -> Result<Tensor, candle_core::Error> {
+        match self {
+            Model::Llama {
+                model: llama,
+                config,
+                cache,
+            } => llama.forward(input, index_pos, cache),
+            Model::Qllama(model) => model.forward(input, index_pos),
+        }
     }
 }
 
@@ -81,9 +106,9 @@ impl Service for LlmService {
 const SYSTEM_MESSAGE: &str = "You are LineraBot, a helpful chatbot for a company called Linera.";
 
 impl ModelContext {
-    fn load_model(&self, model_weights: Vec<u8>) -> Result<ModelWeights, ServiceError> {
-        let cursor = &mut Cursor::new(model_weights);
-        let model_contents = gguf_file::Content::read(cursor).unwrap();
+    fn try_load_gguf(cursor: &mut Cursor<Vec<u8>>) -> Result<ModelWeights, ServiceError> {
+        info!("trying to load model assuming gguf");
+        let model_contents = gguf_file::Content::read(cursor)?;
         let mut total_size_in_bytes = 0;
         for (_, tensor) in model_contents.tensor_infos.iter() {
             let elem_count = tensor.shape.elem_count();
@@ -102,6 +127,57 @@ impl ModelContext {
             cursor,
             &Device::Cpu,
         )?)
+    }
+
+    fn try_load_ggml(cursor: &mut Cursor<Vec<u8>>) -> Result<ModelWeights, ServiceError> {
+        info!("trying to load model assuming ggml");
+        let model_contents = ggml_file::Content::read(cursor, &Device::Cpu)?;
+        let mut total_size_in_bytes = 0;
+        for (_, tensor) in model_contents.tensors.iter() {
+            let elem_count = tensor.shape().elem_count();
+            total_size_in_bytes +=
+                elem_count * tensor.dtype().type_size() / tensor.dtype().block_size();
+        }
+
+        info!(
+            "loaded {:?} tensors ({}B) ",
+            model_contents.tensors.len(),
+            total_size_in_bytes,
+        );
+
+        Ok(ModelWeights::from_ggml(model_contents, 1)?)
+    }
+
+    fn try_load_non_quantized(cursor: &mut Cursor<Vec<u8>>) -> Result<Model, ServiceError> {
+        let config = llama2_c::Config::from_reader(cursor)?;
+        println!("{config:?}");
+        let weights =
+            llama2_c_weights::TransformerWeights::from_reader(cursor, &config, &Device::Cpu)?;
+        let vb = weights.var_builder(&config, &Device::Cpu)?;
+        let cache = llama2_c::Cache::new(true, &config, vb.pp("rot"))?;
+        let llama = Llama::load(vb, config.clone())?;
+        Ok(Model::Llama {
+            model: llama,
+            config,
+            cache,
+        })
+    }
+
+    fn load_model(&self, model_weights: Vec<u8>) -> Result<Model, ServiceError> {
+        let mut cursor = Cursor::new(model_weights);
+        if let Ok(model) = Self::try_load_gguf(&mut cursor) {
+            return Ok(Model::Qllama(model))
+        }
+        cursor.seek(SeekFrom::Start(0)).expect("seeking to 0");
+        if let Ok(model) = Self::try_load_ggml(&mut cursor) {
+            return Ok(Model::Qllama(model))
+        }
+        cursor.seek(SeekFrom::Start(0)).expect("seeking to 0");
+        if let Ok(model) = Self::try_load_non_quantized(&mut cursor) {
+            return Ok(model)
+        }
+        // might need a 'model not supported variant'
+        Err(ServiceError::QueriesNotSupported)
     }
 
     // Copied mostly from https://github.com/huggingface/candle/blob/57267cd53612ede04090853680125b17956804f3/candle-examples/examples/quantized/main.rs
@@ -124,73 +200,34 @@ impl ModelContext {
         let tokenizer = Tokenizer::from_bytes(tokenizer_bytes)
             .map_err(|e| ServiceError::Tokenizer(format!("{}", e)))?;
         info!("tokenizer: {:?}", tokenizer);
-        let mut token_output_stream = TokenOutputStream::new(tokenizer);
-        let tokens = token_output_stream
-            .tokenizer()
+        println!("starting the inference loop");
+        let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+        let mut index_pos = 0;
+
+        let mut tokens = tokenizer
             .encode(prompt_string, true)
-            .map_err(|e| ServiceError::Tokenizer(format!("{}", e)))?;
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        let mut tokenizer = TokenOutputStream::new(tokenizer);
 
-        let prompt_tokens = tokens.get_ids().to_vec();
-        info!("prompt tokens: {:?}", prompt_tokens);
-        let to_sample = 20usize.saturating_sub(1); // 1000 is the default value in candle example
-        let prompt_tokens = if prompt_tokens.len() + to_sample > model::MAX_SEQ_LEN - 10 {
-            let to_remove = prompt_tokens.len() + to_sample + 10 - model::MAX_SEQ_LEN;
-            prompt_tokens[prompt_tokens.len().saturating_sub(to_remove)..].to_vec()
-        } else {
-            prompt_tokens
-        };
-        let mut all_tokens = vec![];
-        let seed = 299792458; // taken as the default value from the candle example.
-        let mut logits_processor = LogitsProcessor::new(seed, None, None);
+        for index in 0.. {
+            let context_size = if index > 0 { 1 } else { tokens.len() };
+            let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
+            let input = Tensor::new(ctxt, &Device::Cpu)?.unsqueeze(0)?;
+            let logits = model.forward(&input, index_pos)?;
+            let logits = logits.i((0, logits.dim(1)? - 1))?;
+            index_pos += ctxt.len();
 
-        let mut next_token = 0;
-        for (pos, token) in prompt_tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &Device::Cpu)?.unsqueeze(0)?;
-            let logits = model.forward(&input, pos)?;
-            let logits = logits.squeeze(0)?;
-            next_token = logits_processor.sample(&logits)?
-        }
-
-        all_tokens.push(next_token);
-        if let Some(t) = token_output_stream.next_token(next_token)? {
-            output.push_str(&t);
-        }
-
-        let eos_token = "</s>";
-        let eos_token = *token_output_stream
-            .tokenizer()
-            .get_vocab(true)
-            .get(eos_token)
-            .unwrap();
-        let repeat_penatly = 1.1; // taken from candle example
-        let repeat_last_n = 64; // taken from candle example
-        for index in 0..to_sample {
-            info!("index: {}", index);
-            let input = Tensor::new(&[next_token], &Device::Cpu)?.unsqueeze(0)?;
-            let logits = model.forward(&input, prompt_tokens.len() + index)?;
-            let logits = logits.squeeze(0)?;
-
-            let start_at = all_tokens.len().saturating_sub(repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
-                &logits,
-                repeat_penatly,
-                &all_tokens[start_at..],
-            )?;
-
-            next_token = logits_processor.sample(&logits)?;
-            all_tokens.push(next_token);
-            if let Some(t) = token_output_stream.next_token(next_token)? {
+            let next_token = logits_processor.sample(&logits)?;
+            tokens.push(next_token);
+            if let Some(t) = tokenizer.next_token(next_token)? {
+                print!("{t}");
                 output.push_str(&t);
             }
-            if next_token == eos_token {
-                break;
-            };
         }
-        if let Some(rest) = token_output_stream
-            .decode_rest()
-            .map_err(ServiceError::Candle)?
-        {
-            output.push_str(&rest)
+        if let Some(rest) = tokenizer.decode_rest().unwrap() {
+            output.push_str(&rest);
         }
         Ok(output)
     }
@@ -208,7 +245,7 @@ pub enum ServiceError {
     InvalidQuery(#[from] serde_json::Error),
     // Add error variants here.
     /// Invalid query argument; could not deserialize request.
-    #[error("Candle error")]
+    #[error("Candle error {0}")]
     Candle(#[from] candle_core::Error),
 
     #[error("Tokenizer error")]
