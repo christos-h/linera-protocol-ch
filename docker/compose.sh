@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT INT
 
 cd "$ROOT_DIR"
-docker build -f docker/Dockerfile . -t linera-test
+docker build -f docker/Dockerfile . -t linera
 
 cd "$SCRIPT_DIR"
 

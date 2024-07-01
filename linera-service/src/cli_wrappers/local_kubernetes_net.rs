@@ -394,7 +394,7 @@ impl LocalKubernetesNet {
         let github_root = get_github_root().await?;
         // Build Docker image
         let docker_image = DockerImage::build(
-            String::from("linera-test:latest"),
+            String::from("linera:latest"),
             &self.binaries,
             &github_root,
         )
