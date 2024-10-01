@@ -51,7 +51,7 @@ use {
 };
 
 use crate::{
-    client::{ChainClient, Client},
+    client::{ChainClient, Client, ClientMode},
     data_types::*,
     node::{
         CrossChainMessageDelivery, LocalValidatorNodeProvider, NodeError, NotificationStream,
@@ -799,6 +799,7 @@ where
             block_height,
             None,
             BTreeMap::new(),
+            ClientMode::Optimistic,
         ))
     }
 
